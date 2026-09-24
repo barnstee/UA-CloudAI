@@ -1,0 +1,119 @@
+# ---------------------------------------------------------------------------
+# UA-CloudAI - MCP (Model Context Protocol) server exposing the plant to agentic
+# AI applications.
+#
+# It fronts TWO APIs that already exist in the reference solution:
+#   - the I3X server (i3x4influx) for the semantic ISA-95 graph, and
+#   - UA Cloud Action's OPC UA Web API for the raw address space.
+#
+# Apply this alongside cloud.yaml, with the same envsubst variable list:
+#   envsubst '${IOT_USERNAME} ${IOT_PASSWORD}' < deployment.yaml | kubectl apply -f -
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ua-cloudai
+  namespace: cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ua-cloudai
+  template:
+    metadata:
+      labels:
+        app: ua-cloudai
+    spec:
+      containers:
+        - name: ua-cloudai
+          image: ghcr.io/barnstee/ua-cloudai:main
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: http
+          env:
+            - name: MCP_TRANSPORT
+              value: "http"
+            - name: MCP_PORT
+              value: "5000"
+
+            # --- downstream: I3X semantic graph ---
+            - name: I3X_BASE_URL
+              value: "http://i3x4influx.cloud.svc.cluster.local:8084"
+
+            # --- downstream: UA Cloud Action OPC UA Web API ---
+            - name: OPCUA_WEBAPI_BASE_URL
+              value: "http://ua-cloudaction.cloud.svc.cluster.local:8082"
+
+            # Both downstream APIs use the shared demo credentials. Setting
+            # IOT_USERNAME / IOT_PASSWORD covers both; use the per-backend
+            # variables (I3X_USERNAME, OPCUA_WEBAPI_USERNAME, ...) to split them.
+            - name: IOT_USERNAME
+              value: "${IOT_USERNAME}"
+            - name: IOT_PASSWORD
+              value: "${IOT_PASSWORD}"
+
+            # --- inbound: credentials MCP clients must present to this server ---
+            # Without these the MCP endpoint serves anonymously, and anyone who can
+            # reach it can read the entire plant. Keep them set.
+            - name: MCP_USERNAME
+              value: "${IOT_USERNAME}"
+            - name: MCP_PASSWORD
+              value: "${IOT_PASSWORD}"
+
+            # Caps how many items one tool call returns, protecting the model's
+            # context window from an unbounded browse.
+            - name: MCP_MAX_RESULTS
+              value: "200"
+
+            # --- TLS ---
+            # Basic auth sends reversible credentials on EVERY request, so serve it over
+            # TLS. These paths match the keys a kubernetes.io/tls Secret mounts.
+            # Create the Secret first, for example:
+            #   kubectl create secret tls ua-cloudai-tls -n cloud \
+            #     --cert=tls.crt --key=tls.key
+            - name: MCP_TLS_PEM_PATH
+              value: "/tls/tls.crt"
+            - name: MCP_TLS_KEY_PATH
+              value: "/tls/tls.key"
+
+            # The backends in this solution use privately issued certificates once they are
+            # switched to HTTPS. Prefer pinning their CA, which keeps validation enabled:
+            # - name: BACKEND_CA_CERT_PATH
+            #   value: "/backend-ca/ca.crt"
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 20
+      volumes:
+        - name: tls
+          secret:
+            secretName: ua-cloudai-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ua-cloudai
+  namespace: cloud
+spec:
+  type: LoadBalancer
+  selector:
+    app: ua-cloudai
+  ports:
+    - name: http
+      port: 5001
+      targetPort: 5000
